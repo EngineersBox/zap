@@ -1,7 +1,7 @@
 const std = @import("std");
 const Pool = @This();
 
-sync: std.atomic.Value(Sync) align(std.atomic.cache_line),
+sync: std.atomic.Value(u32) align(std.atomic.cache_line),
 idle: std.atomic.Value(u32) = .{ .raw = 0 },
 injector: [2]std.atomic.Value(?*Task) align(std.atomic.cache_line) = .{ .{ .raw = null }, .{ .raw = null } },
 workers: std.atomic.Value(?*Worker) align(std.atomic.cache_line) = .{ .raw = null },
@@ -25,11 +25,11 @@ const Sync = packed struct(u32) {
 
 pub fn init(max_threads: usize) Pool {
     const max = std.math.lossyCast(u10, max_threads);
-    return .{ .sync = .{ .raw = .{ .max = max, .spawnable = max } } };
+    return .{ .sync = .{ .raw = @bitCast(Sync{ .max = max, .spawnable = max }) } };
 }
 
 pub fn deinit(self: *Pool) void {
-    const sync = self.sync.fetchAdd(.{ .shutdown = true }, .acq_rel);
+    const sync: Sync = @bitCast(self.sync.fetchAdd(@bitCast(Sync{ .shutdown = true }), .acq_rel));
     if (sync.idle > 0) {
         _ = self.idle.fetchOr(2, .release);
         std.Thread.Futex.wake(&self.idle, std.math.maxInt(u32));
@@ -46,11 +46,11 @@ pub const Task = struct {
 
 pub fn schedule(noalias self: *Pool, noalias task: *Task) void {
     if (Worker.current) |worker| blk: {
-        @branchHint(.likely);
+        // @branchHint(.likely);
         const tail = worker.tail.raw;
         const head = worker.head.load(.monotonic);
         if (tail -% head == worker.array.len) {
-            @branchHint(.unlikely);
+            // @branchHint(.unlikely);
             const move = worker.array.len / 2;
             _ = worker.head.cmpxchgStrong(head, head +% move, .acquire, .monotonic) orelse {
                 var last = task;
@@ -64,17 +64,17 @@ pub fn schedule(noalias self: *Pool, noalias task: *Task) void {
         worker.array[tail % worker.array.len].store(task, .monotonic);
         worker.tail.store(tail +% 1, .release);
     } else inject(&self.injector, task, task);
-    self.notify(self.sync.load(.seq_cst));
+    self.notify(@bitCast(self.sync.load(.seq_cst)));
 }
 
 fn notify(self: *Pool, curr: Sync) void {
     if ((curr.shutdown or curr.notified) or (curr.idle | curr.spawnable) == 0) return;
-    if (self.sync.fetchOr(.{ .notified = true }, .acquire).notified) return;
+    if (@as(Sync, @bitCast(self.sync.fetchOr(@bitCast(Sync{ .notified = true }), .acquire))).notified) return;
 
-    var sync = self.sync.load(.monotonic);
+    var sync: Sync = @bitCast(self.sync.load(.monotonic));
     if (sync.shutdown) return;
     if (sync.idle == 0 and sync.spawnable > 0) blk: {
-        sync = self.sync.fetchAdd(Sync.delta(.{ .idle = 1 }, .{ .spawnable = 1 }), .acquire);
+        sync = @bitCast(self.sync.fetchAdd(@bitCast(Sync.delta(.{ .idle = 1 }, .{ .spawnable = 1 })), .acquire));
         if (sync.shutdown) return self.finish();
         const thread = std.Thread.spawn(.{}, Worker.run, .{self}) catch break :blk self.finish();
         return thread.detach();
@@ -85,7 +85,7 @@ fn notify(self: *Pool, curr: Sync) void {
 }
 
 noinline fn finish(self: *Pool) void {
-    const sync = self.sync.fetchAdd(Sync.delta(.{ .spawnable = 1 }, .{ .idle = 1 }), .acq_rel);
+    const sync: Sync = @bitCast(self.sync.fetchAdd(@bitCast(Sync.delta(.{ .spawnable = 1 }, .{ .idle = 1 })), .acq_rel));
     if (sync.shutdown and sync.spawnable + 1 == sync.max) {
         if (self.workers.load(.acquire)) |worker| {
             if (worker.join.swap(2, .release) > 0) std.Thread.Futex.wake(&worker.join, 1);
@@ -180,10 +180,10 @@ const Worker = struct {
                 if (self.target == start) break;
             }
 
-            const sync = pool.sync.fetchAdd(Sync.delta(.{ .idle = @intFromBool(self.active) }, .{ .notified = !self.active }), .seq_cst);
+            const sync: Sync = @bitCast(pool.sync.fetchAdd(@bitCast(Sync.delta(.{ .idle = @intFromBool(self.active) }, .{ .notified = !self.active })), .seq_cst));
             self.active = false;
             if (sync.shutdown) return null;
-            if (pool.injector[0].load(.seq_cst) != null and !pool.sync.fetchOr(.{ .notified = true }, .acquire).notified) continue;
+            if (pool.injector[0].load(.seq_cst) != null and !@as(Sync, @bitCast(pool.sync.fetchOr(@bitCast(Sync{ .notified = true }), .acquire))).notified) continue;
 
             var idle = pool.idle.load(.acquire);
             while (true) {
@@ -195,9 +195,9 @@ const Worker = struct {
 
         if (!self.active) {
             const stop = Sync.delta(.{}, .{ .notified = true, .idle = 1 });
-            pool.notify(pool.sync.fetchAdd(stop, .seq_cst).add(stop));
+            pool.notify(@as(Sync, @bitCast(pool.sync.fetchAdd(@bitCast(stop), .seq_cst))).add(stop));
         } else if (@intFromPtr(result) & 1 > 0) {
-            pool.notify(pool.sync.load(.seq_cst));
+            pool.notify(@bitCast(pool.sync.load(.seq_cst)));
         }
         self.active = true;
         return @ptrFromInt(@intFromPtr(result) & ~@as(usize, 1));

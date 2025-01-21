@@ -4,13 +4,17 @@ pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    _ = b.addModule("zig-datetime", .{ .root_source_file = b.path("v2.zig") });
+    _ = b.addModule("zap", .{
+        .root_source_file = b.path("src/v2.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const exe = b.addExecutable(.{
         .name = "bench",
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("bench.zig"),
+        .root_source_file = b.path("src/bench.zig"),
         .link_libc = true,
     });
     b.installArtifact(exe);
